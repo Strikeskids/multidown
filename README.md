@@ -4,6 +4,10 @@ Downloads files over HTTP with multiple streams to assuage rate limiting. Unlike
 
 ## Example Usage
 
+First build the executable (no external dependencies besides golang)
+
+    $ go build main.go
+
 Download a file
 
     $ multidown http://myslowwebsite.com/file.mp4
