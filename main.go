@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"time"
@@ -14,7 +13,7 @@ import (
 type Download struct {
 	position   int64
 	size       int64
-	segmentNum int64
+	segmentNum int
 }
 
 type ProgressUpdate struct {
@@ -22,9 +21,10 @@ type ProgressUpdate struct {
 	downloaded int64
 }
 
-type ProgressInfoHeader struct {
+type ProgressInfo struct {
 	Length      int64
 	SegmentSize int64
+	segments    []bool
 }
 
 const (
@@ -55,19 +55,18 @@ func download_segments(threadnum uint, url string, instructions chan Download, u
 
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
-			log.Fatal("Failed to create request")
-			instructions <- down
-			break
+			fmt.Fprintln(os.Stderr, "Failed to create request")
+			os.Exit(1)
 		}
 
 		req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d", down.position, down.position+down.size-1))
 
 		resp, err := client.Do(req)
-		if err != nil || resp.StatusCode != 206 {
+		if err != nil || (resp.StatusCode != 206 && resp.StatusCode != 200) {
 			errorCount++
 			if errorCount > 3 {
-				log.Fatal("Failed to run GET too many times")
-				break
+				fmt.Fprintln(os.Stderr, "Failed to run GET too many times. Check network connection?")
+				os.Exit(1)
 			} else {
 				continue
 			}
@@ -92,7 +91,7 @@ func download_segments(threadnum uint, url string, instructions chan Download, u
 		if read >= down.size {
 			finished = true
 			buf[0] = finishedSegment
-			progressFile.WriteAt(buf[:1], baseOffset+down.segmentNum)
+			progressFile.WriteAt(buf[:1], baseOffset+int64(down.segmentNum))
 		} else {
 			down.position += read
 			down.size -= read
@@ -100,7 +99,14 @@ func download_segments(threadnum uint, url string, instructions chan Download, u
 	}
 }
 
-func print_progress(updates chan ProgressUpdate, numThreads uint) {
+func print_progress(updates chan ProgressUpdate, numThreads uint, quiet bool) {
+	if quiet {
+		for update := <-updates; update.downloaded >= 0; {
+			update = <-updates
+		}
+		return
+	}
+
 	fmt.Print("\n")
 
 	startTime := time.Now()
@@ -124,49 +130,53 @@ func findFileLength(url string) int64 {
 	resp, err := client.Head(url)
 
 	if err != nil || resp.StatusCode != 200 || resp.ContentLength == -1 {
-		log.Fatalf("Failed to get file length %s (%d): %s", resp.Status, resp.ContentLength, err)
+		fmt.Fprintf(os.Stderr, "Failed to get file length: (Status) %s (Length) %d (Err) %s\n", resp.Status, resp.ContentLength, err)
+		os.Exit(1)
 	}
 
 	return resp.ContentLength
 }
 
-func setupProgressFile(filename string, length, increment int64, forceClean bool) (file *os.File, segmentSize, segmentCount int64, segments []bool, err error) {
+func countTrue(arr []bool) int {
+	count := 0
+	for _, b := range arr {
+		if b {
+			count++
+		}
+	}
+	return count
+}
 
-	var clean bool = true
+func findSegmentCount(length, segmentSize int64) int64 {
+	return (length + segmentSize - 1) / segmentSize
+}
 
-	segmentSize = increment
+func setupProgressFile(filename string, length, segmentSize int64, forceClean bool, quiet bool) (file *os.File,
+	info ProgressInfo, clean bool, err error) {
 
 	if !forceClean {
-		infoLength, infoSegmentSize, infoSegments, err := readProgressInfo(filename)
-		if err != nil {
-			clean = true
-		} else if length != infoLength {
-			clean = true
-		} else {
-			segments = infoSegments
-			segmentSize = infoSegmentSize
-			clean = false
-		}
+		info, err = readProgressInfo(filename)
+		clean = err != nil || length != info.Length ||
+			findSegmentCount(length, info.SegmentSize) != int64(len(info.segments))
 	} else {
 		clean = true
 	}
 
-	segmentCount = (length + segmentSize - 1) / segmentSize
-
 	if clean {
+		segmentCount := findSegmentCount(length, segmentSize)
 		file, err = beginProgressFile(filename, length, segmentSize)
 		if err != nil {
 			return
 		}
-		segments = make([]bool, segmentCount)
+		info.Length = length
+		info.SegmentSize = segmentSize
+		info.segments = make([]bool, segmentCount)
 	} else {
-		finishedSegments := 0
-		for seg := int64(0); seg < segmentCount; seg++ {
-			if segments[seg] {
-				finishedSegments++
-			}
+		if !quiet {
+			segmentCount := findSegmentCount(info.Length, info.SegmentSize)
+			finishedSegments := countTrue(info.segments)
+			fmt.Printf("Resuming file download %d/%d\n", finishedSegments, segmentCount)
 		}
-		fmt.Printf("Resuming file download %d/%d\n", finishedSegments, segmentCount)
 		file, err = os.OpenFile(filename, os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
 			fmt.Print(err)
@@ -184,7 +194,7 @@ func beginProgressFile(filename string, length, segmentSize int64) (file *os.Fil
 		return
 	}
 
-	header := ProgressInfoHeader{Length: length, SegmentSize: segmentSize}
+	header := ProgressInfo{Length: length, SegmentSize: segmentSize}
 
 	if n, err := file.WriteString("MULD"); n != 4 || err != nil {
 		return nil, err
@@ -198,14 +208,13 @@ func beginProgressFile(filename string, length, segmentSize int64) (file *os.Fil
 	return
 }
 
-func readProgressInfo(filename string) (length, segmentSize int64, segments []bool, err error) {
+func readProgressInfo(filename string) (info ProgressInfo, err error) {
 	file, err := os.Open(filename)
 	defer file.Close()
 
 	if err != nil {
 		return
 	}
-	var header ProgressInfoHeader
 
 	var buf [8192]byte
 	n, err := file.Read(buf[:4])
@@ -215,18 +224,17 @@ func readProgressInfo(filename string) (length, segmentSize int64, segments []bo
 	}
 
 	decoder := gob.NewDecoder(file)
-	if err = decoder.Decode(&header); err != nil {
+	if err = decoder.Decode(&info); err != nil {
 		return
 	}
-	length, segmentSize = header.Length, header.SegmentSize
 
-	segmentCount := (length + segmentSize - 1) / segmentSize
+	segmentCount := findSegmentCount(info.Length, info.SegmentSize)
 	if segmentCount > maxSegments {
 		err = errors.New("too many segments")
 		return
 	}
 
-	segments = make([]bool, segmentCount)
+	info.segments = make([]bool, segmentCount)
 
 	file.Seek(baseOffset, os.SEEK_SET)
 	for i := int64(0); i < segmentCount; {
@@ -237,7 +245,7 @@ func readProgressInfo(filename string) (length, segmentSize int64, segments []bo
 		}
 
 		for j := int64(0); j < numRead && i+j < segmentCount; j++ {
-			segments[i+j] = (buf[j] == finishedSegment)
+			info.segments[i+j] = (buf[j] == finishedSegment)
 		}
 		i += numRead
 	}
@@ -247,31 +255,41 @@ func readProgressInfo(filename string) (length, segmentSize int64, segments []bo
 	return
 }
 
-func download(url string, filename string, numThreads uint) {
+func download(url string, filename string, numThreads uint, quiet bool) {
 	client = &http.Client{}
 
 	length := findFileLength(url)
 
 	progressFilename := fmt.Sprintf("%s.multidownload", filename)
 	defer os.Remove(progressFilename)
-	fmt.Printf("Download file %.2fMB\n", float64(length)/1e6)
+	if !quiet {
+		fmt.Printf("Download file %.2fMB\n", float64(length)/1e6)
+	}
 
 	fileinfo, err := os.Stat(filename)
 	if _, progerr := os.Stat(progressFilename); err == nil && fileinfo.Size() == length && progerr != nil {
-		log.Print("File already downloaded")
+		if !quiet {
+			fmt.Println("File already downloaded")
+		}
 		return
 	}
 
-	progressFile, segmentSize, segmentCount, segments, err := setupProgressFile(progressFilename, length, int64(1000000), err != nil)
+	progressFile, info, truncate, err := setupProgressFile(progressFilename, length, int64(1000000), err != nil, quiet)
 
 	if err != nil {
-		log.Fatalf("Failed to setup progress file: %s", err)
+		fmt.Fprintf(os.Stderr, "Failed to setup progress file: %s\n", err)
+		os.Exit(1)
 	}
 	defer progressFile.Close()
 
-	file, err := os.OpenFile(filename, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0666)
+	outopts := os.O_RDWR|os.O_APPEND|os.O_CREATE
+	if truncate {
+		outopts |= os.O_TRUNC
+	}
+	file, err := os.OpenFile(filename, outopts, 0666)
 	if err != nil {
-		log.Fatalf("Unable to open output file: %s", err)
+		fmt.Fprintf(os.Stderr, "Unable to open output file: %s\n", err)
+		os.Exit(1)
 	}
 	defer file.Close()
 
@@ -282,30 +300,31 @@ func download(url string, filename string, numThreads uint) {
 		go download_segments(i, url, instructions, updates, file, progressFile)
 	}
 
-	go print_progress(updates, numThreads)
+	go print_progress(updates, numThreads, quiet)
 
-	for seg := int64(0); seg < segmentCount; seg++ {
-		if segments[seg] {
+	for seg := 0; seg < len(info.segments); seg++ {
+		if info.segments[seg] {
 			continue
 		}
 
-		left := segmentSize
-		pos := seg * segmentSize
-		if pos+segmentSize > length {
-			left = length - pos
+		left := info.SegmentSize
+		pos := int64(seg) * info.SegmentSize
+		if pos+info.SegmentSize > info.Length {
+			left = info.Length - pos
 		}
 
 		instructions <- Download{position: pos, size: left, segmentNum: seg}
 	}
 
 	for i := uint(0); i < numThreads; i++ {
-		instructions <- Download{position: length, size: 0}
+		instructions <- Download{position: info.Length, size: 0}
 	}
 }
 
 func main() {
 	outputPtr := flag.String("o", "video.mp4", "output file")
 	numThreadsPtr := flag.Uint("n", 4, "number of threads")
+	quietPtr := flag.Bool("q", false, "quiet output. only errors displayed")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of multidown: multidown [-o outputfile] [-n numthreads] url\n")
@@ -315,12 +334,17 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() < 1 {
-		log.Fatal("Need to specify a url to download")
+		fmt.Fprintln(os.Stderr, "Need to specify a url to download")
+		os.Exit(1)
+	} else if flag.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "Only one url will download at a time")
+		os.Exit(1)
 	}
 
 	if *numThreadsPtr == 0 {
-		log.Fatal("Running with zero threads means nothing will download")
+		fmt.Fprintln(os.Stderr, "Running with zero threads means nothing will download")
+		os.Exit(1)
 	}
 
-	download(flag.Arg(0), *outputPtr, *numThreadsPtr)
+	download(flag.Arg(0), *outputPtr, *numThreadsPtr, *quietPtr)
 }
