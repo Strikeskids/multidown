@@ -188,7 +188,6 @@ func setupProgressFile(filename string, length, segmentSize int64, forceClean bo
 }
 
 func beginProgressFile(filename string, length, segmentSize int64) (file *os.File, err error) {
-
 	file, err = os.Create(filename)
 	if err != nil {
 		return
