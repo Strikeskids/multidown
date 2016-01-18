@@ -31,26 +31,26 @@ const (
 	maxSegments     = 50000
 	finishedSegment = 0x59
 	baseOffset      = 256
+	threadnumFinished = 0x1000
 )
 
 var client *http.Client
 
-func download_segments(threadnum uint, url string, instructions chan Download, updates chan ProgressUpdate,
-	file *os.File, progressFile *os.File) {
+func download_segments(threadnum uint, url string, backlog chan Download, instructions chan Download, 
+	updates chan ProgressUpdate, file *os.File, progressFile *os.File) {
 
-	finished := true
 	buf := make([]byte, 8192)
 	total := int64(0)
 	errorCount := int64(0)
 
 	var down Download
 	for {
-		if finished {
-			down = <-instructions
-			if down.size == 0 {
-				break
-			}
-			finished = false
+		select {
+		case down = <-backlog:
+		case down = <-instructions:
+		}
+		if down.size == 0 {
+			break
 		}
 
 		req, err := http.NewRequest("GET", url, nil)
@@ -63,13 +63,11 @@ func download_segments(threadnum uint, url string, instructions chan Download, u
 
 		resp, err := client.Do(req)
 		if err != nil || (resp.StatusCode != 206 && resp.StatusCode != 200) {
+			backlog <- down
+			updates <- ProgressUpdate{threadnum: threadnum, downloaded: -errorCount}
+			time.Sleep(time.Duration(1 << uint64(errorCount)) * 10 * time.Millisecond)
 			errorCount++
-			if errorCount > 3 {
-				fmt.Fprintln(os.Stderr, "Failed to run GET too many times. Check network connection?")
-				os.Exit(1)
-			} else {
-				continue
-			}
+			continue
 		}
 
 		errorCount = 0
@@ -89,19 +87,19 @@ func download_segments(threadnum uint, url string, instructions chan Download, u
 		}
 
 		if read >= down.size {
-			finished = true
 			buf[0] = finishedSegment
 			progressFile.WriteAt(buf[:1], baseOffset+int64(down.segmentNum))
 		} else {
 			down.position += read
 			down.size -= read
+			backlog <- down
 		}
 	}
 }
 
 func print_progress(updates chan ProgressUpdate, numThreads uint, quiet bool) {
 	if quiet {
-		for update := <-updates; update.downloaded >= 0; {
+		for update := <-updates; update.threadnum != threadnumFinished; {
 			update = <-updates
 		}
 		return
@@ -114,15 +112,21 @@ func print_progress(updates chan ProgressUpdate, numThreads uint, quiet bool) {
 	var total int64 = 0
 	for {
 		update := <-updates
-		if update.downloaded < 0 {
+		if update.threadnum == threadnumFinished {
 			break
 		}
-		result := float64(update.downloaded) / 1000 / float64(time.Since(startTime)/time.Second)
-		total += update.downloaded - counts[update.threadnum]
-		counts[update.threadnum] = update.downloaded
+		fmt.Printf("\x1b[F")
+		if update.downloaded < 0 {
+			fmt.Printf("\x1b[%dG%9dERR", update.threadnum*15, -update.downloaded)
+		} else {
+			result := float64(update.downloaded) / 1000 / float64(time.Since(startTime)/time.Second)
+			total += update.downloaded - counts[update.threadnum]
+			counts[update.threadnum] = update.downloaded
 
-		fmt.Printf("\x1b[F\x1b[%dG%10.2fkB\x1b[%dG%10.2fMB\n",
-			update.threadnum*15, result, numThreads*15, float64(total)/1e6)
+			fmt.Printf("\x1b[%dG%10.2fkB", update.threadnum*15, result)
+		}
+
+		fmt.Printf("\x1b[%dG%10.2fMB\n", numThreads*15, float64(total)/1e6)
 	}
 }
 
@@ -293,10 +297,11 @@ func download(url string, filename string, numThreads uint, quiet bool) {
 	defer file.Close()
 
 	instructions := make(chan Download)
+	backlog := make(chan Download, numThreads)
 	updates := make(chan ProgressUpdate)
 
 	for i := uint(0); i < numThreads; i++ {
-		go download_segments(i, url, instructions, updates, file, progressFile)
+		go download_segments(i, url, backlog, instructions, updates, file, progressFile)
 	}
 
 	go print_progress(updates, numThreads, quiet)
@@ -318,6 +323,7 @@ func download(url string, filename string, numThreads uint, quiet bool) {
 	for i := uint(0); i < numThreads; i++ {
 		instructions <- Download{position: info.Length, size: 0}
 	}
+	updates <- ProgressUpdate{threadnum: threadnumFinished}
 }
 
 func main() {
